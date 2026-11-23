@@ -1,0 +1,270 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+// EyeEnemy.cpp - Implementation (the "behavior") of the floating eye enemy.
+// The matching declarations for every function below are in EyeEnemy.h.
+#include "EyeEnemy.h"
+#include "Components/SphereComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "GameFramework/FloatingPawnMovement.h"
+#include "NavigationSystem.h"
+#include "NavigationPath.h"
+#include "Kismet/GameplayStatics.h"
+#include <Templates/Casts.h>
+#include <Containers/Array.h>
+#include <HAL/Platform.h>
+#include <Math/MathFwd.h>
+#include <Math/UnrealMathUtility.h>
+#include <UObject/NameTypes.h>
+#include <Engine/EngineTypes.h>
+#include <Engine/HitResult.h>
+#include <GameFramework/Actor.h>
+#include <GameFramework/Controller.h>
+#include <GameFramework/Pawn.h>
+#include <CollisionQueryParams.h>
+
+// Constructor: Unreal calls this as the class creates actor components.
+AEyeEnemy::AEyeEnemy()
+{
+	// Tick is required because this actor updates vision, movement, and bobbing.
+	PrimaryActorTick.bCanEverTick = true;
+
+	// Create a collision root component. It is deliberately non-colliding.
+	CollisionComponent = CreateDefaultSubobject<USphereComponent>(TEXT("Collision"));
+	CollisionComponent->InitSphereRadius(40.0f);
+	CollisionComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	RootComponent = CollisionComponent;
+
+	// Create the visible mesh component. The mesh and material assigned in the
+	// Unreal Details panel will be rendered through this component.
+	EyeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("EyeMesh"));
+	EyeMesh->SetupAttachment(RootComponent);
+	EyeMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// Create the spotlight. SetVisibility(bLightEnabled) is the C++ switch
+	// that turns the effect on or off for this actor instance.
+	EyeLight = CreateDefaultSubobject<USpotLightComponent>(TEXT("EyeLight"));
+	EyeLight->SetupAttachment(RootComponent);
+	EyeLight->SetIntensity(LightIntensity);
+	EyeLight->SetAttenuationRadius(LightAttenuationRadius);
+	EyeLight->SetVisibility(bLightEnabled);
+
+	FloatingMovement = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("FloatingMovement"));
+	FloatingMovement->MaxSpeed = WanderSpeed;
+	FloatingMovement->Acceleration = 600.0f;
+	FloatingMovement->Deceleration = 600.0f;
+}
+
+// BeginPlay is called once after the actor enters the level or is spawned.
+void AEyeEnemy::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Remember where the enemy started. Wandering stays near this location.
+	WanderOrigin = GetActorLocation();
+	NextWanderTime = GetWorld()->GetTimeSeconds();
+	NextVisionCheckTime = GetWorld()->GetTimeSeconds();
+	NextPursuitPathTime = GetWorld()->GetTimeSeconds();
+
+	// Find the pawn controlled by the first local player. This avoids needing
+	// actor tags or searching for every Pawn on every vision check.
+	PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+
+	EyeLight->SetIntensity(LightIntensity);
+	EyeLight->SetAttenuationRadius(LightAttenuationRadius);
+	EyeLight->SetVisibility(bLightEnabled);
+	ChooseWanderPoint();
+}
+
+// Tick runs every frame. DeltaTime is the elapsed time since the previous frame.
+void AEyeEnemy::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	// Check whether the player is visible before changing movement speed.
+	UpdateVision();
+
+	// The ternary expression chooses PursuitSpeed when target is visible,
+	// otherwise it chooses the slower WanderSpeed.
+	FloatingMovement->MaxSpeed = CurrentPlayerTarget ? PursuitSpeed : WanderSpeed;
+	MoveAlongCurrentPath(DeltaTime);
+	UpdateRotation(DeltaTime);
+	UpdateBobbing(DeltaTime);
+}
+
+// Invulnerability is implemented by accepting the damage call but returning zero.
+float AEyeEnemy::TakeDamage(float Damage, struct FDamageEvent const& DamageEvent,
+AController* EventInstigator, AActor* DamageCauser)
+{
+	return 0.0f;
+}
+
+// Finds a random reachable destination within WanderRadius.
+// The NavMesh determines whether a location is valid for an enemy to walk/fly to.
+void AEyeEnemy::ChooseWanderPoint()
+{
+	if (UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld()))
+	{
+		FVector WanderPoint;
+		if (NavSystem->K2_GetRandomReachablePointInRadius(this, WanderOrigin, WanderPoint, WanderRadius))
+		{
+			ChooseNavPoint(WanderPoint);
+			return;
+		}
+	}
+
+	const FVector RandomOffset = FVector(FMath::RandRange(-WanderRadius, WanderRadius), FMath::RandRange(-WanderRadius, WanderRadius), 0.0f);
+	ChooseNavPoint(WanderOrigin + RandomOffset);
+}
+
+// Converts one destination into a sequence of NavMesh path points.
+// Reaching every point one at a time makes the enemy follow the route safely.
+void AEyeEnemy::ChooseNavPoint(const FVector& Destination)
+{
+	UNavigationSystemV1* NavSystem = UNavigationSystemV1::GetCurrent(GetWorld());
+	if (!NavSystem)
+	{
+		CurrentPath.Reset();
+		return;
+	}
+
+	UNavigationPath* NavigationPath = NavSystem->FindPathToLocationSynchronously(
+		GetWorld(), GetActorLocation(), Destination);
+
+	if (!NavigationPath || !NavigationPath->IsValid() || NavigationPath->PathPoints.Num() == 0)
+	{
+		CurrentPath.Reset();
+		return;
+	}
+
+	CurrentPath = NavigationPath->PathPoints;
+	CurrentPathIndex = 1 < CurrentPath.Num() ? 1 : 0;
+}
+
+// Moves through the currently calculated NavMesh path.
+void AEyeEnemy::MoveAlongCurrentPath(float DeltaTime)
+{
+	if (CurrentPlayerTarget && GetWorld()->GetTimeSeconds() >= NextPursuitPathTime)
+	{
+		ChooseNavPoint(CurrentPlayerTarget->GetActorLocation());
+		NextPursuitPathTime = GetWorld()->GetTimeSeconds() + 0.25f;
+	}
+
+	if (CurrentPath.Num() == 0 || CurrentPathIndex >= CurrentPath.Num())
+	{
+		if (!CurrentPlayerTarget && GetWorld()->GetTimeSeconds() >= NextWanderTime)
+		{
+			ChooseWanderPoint();
+			NextWanderTime = GetWorld()->GetTimeSeconds() + WanderPointInterval;
+		}
+		return;
+	}
+
+	const FVector Target = CurrentPath[CurrentPathIndex];
+	const FVector Current = GetActorLocation();
+	const FVector ToTarget = (Target - Current).GetSafeNormal2D();
+
+	if (ToTarget.IsNearlyZero())
+	{
+		CurrentPathIndex++;
+		return;
+	}
+
+	FloatingMovement->AddInputVector(ToTarget, true);
+
+	if (FVector::Dist2D(Current, Target) <= NavigationPointAcceptanceRadius)
+	{
+		CurrentPathIndex++;
+	}
+}
+
+// Vision check: find player-controlled or tagged Pawns in a cone in front
+// of the eye, then confirm that no wall or other object blocks the view.
+void AEyeEnemy::UpdateVision()
+{
+	const float TimeSeconds = GetWorld()->GetTimeSeconds();
+	if (TimeSeconds < NextVisionCheckTime)
+	{
+		return;
+	}
+	NextVisionCheckTime = TimeSeconds + VisionCheckInterval;
+
+	// If the possessed character is destroyed or changed at runtime, refresh
+	// it instead of continuing to follow an old pawn.
+	if (!PlayerPawn)
+	{
+		PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+	}
+
+	AActor* VisiblePlayer = nullptr;
+
+	if (PlayerPawn)
+	{
+		const FVector EyeLocation = GetActorLocation();
+		const FVector Forward = GetActorForwardVector();
+		const FVector ToPlayer = PlayerPawn->GetActorLocation() - EyeLocation;
+		const float Distance = ToPlayer.Size();
+		const float HalfVisionAngle = VisionAngleDegrees * 0.5f;
+
+		const float Angle = FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(FVector::DotProduct(Forward, ToPlayer.GetSafeNormal()), -1.0f, 1.0f)));
+
+		if (Distance <= VisionRange && Angle <= HalfVisionAngle)
+		{
+			FHitResult Hit;
+			FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(EyeVision), true, this);
+			const bool bHitSomething = GetWorld()->LineTraceSingleByChannel(
+				Hit, EyeLocation, PlayerPawn->GetActorLocation(), ECC_Visibility, QueryParams);
+
+			if (!bHitSomething || Hit.GetActor() == PlayerPawn)
+			{
+				VisiblePlayer = PlayerPawn;
+			}
+		}
+	}
+
+	CurrentPlayerTarget = VisiblePlayer;
+	EyeLight->SetVisibility(bLightEnabled);
+}
+
+// Applies a smooth vertical sine-wave offset. PreviousBobbingOffset removes
+// the old offset before adding the next one, avoiding cumulative movement.
+void AEyeEnemy::UpdateBobbing(float DeltaTime)
+{
+	BobbingTime += DeltaTime * BobbingFrequency;
+	const float CurrentOffset = FMath::Sin(BobbingTime) * BobbingAmplitude;
+	FVector Location = GetActorLocation();
+	Location.Z += CurrentOffset - PreviousBobbingOffset;
+	SetActorLocation(Location, false);
+	PreviousBobbingOffset = CurrentOffset;
+}
+
+// Rotates smoothly toward the NavMesh destination while wandering,
+// or toward the visible player while pursuing.
+void AEyeEnemy::UpdateRotation(float DeltaTime)
+{
+	AActor* LookTarget = CurrentPlayerTarget;
+	if (!LookTarget && CurrentPath.IsValidIndex(CurrentPathIndex))
+	{
+		LookTarget = nullptr;
+		const FVector TargetLocation = CurrentPath[CurrentPathIndex];
+		const FVector Direction = (TargetLocation - GetActorLocation()).GetSafeNormal2D();
+		if (!Direction.IsNearlyZero())
+		{
+			const FRotator TargetRotation = Direction.Rotation();
+			SetActorRotation(FMath::RInterpTo(GetActorRotation(), TargetRotation, DeltaTime, 6.0f));
+		}
+		return;
+	}
+
+	if (LookTarget)
+	{
+		const FVector Direction = (LookTarget->GetActorLocation() - GetActorLocation()).GetSafeNormal();
+		if (!Direction.IsNearlyZero())
+		{
+			const FRotator TargetRotation = Direction.Rotation();
+			SetActorRotation(FMath::RInterpTo(GetActorRotation(), TargetRotation, DeltaTime, 8.0f));
+		}
+	}
+}
+
