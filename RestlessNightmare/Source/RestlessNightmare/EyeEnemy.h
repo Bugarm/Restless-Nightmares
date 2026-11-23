@@ -1,0 +1,126 @@
+// EyeEnemy.h - Declaration (the "list") of the floating eye enemy.
+// This file defines which Unreal components and editable settings the enemy has.
+// Unreal reflection macros such as UCLASS, UPROPERTY, and UFUNCTION make this
+// C++ class and its settings visible to the Unreal Editor.
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Pawn.h"
+#include "EyeEnemy.generated.h"
+
+class USphereComponent;
+class UStaticMeshComponent;
+class USpotLightComponent;
+class UFloatingPawnMovement;
+
+// This macro exposes AEyeEnemy to Unreal as a placeable C++ actor.
+// The generated EyeEnemy.generated.h file must always remain the final include.
+UCLASS()
+class RESTLESSNIGHTMARE_API AEyeEnemy : public APawn
+{
+	GENERATED_BODY()
+
+public:
+	// The constructor creates components once when the actor is constructed.
+	AEyeEnemy();
+
+	// Tick runs every frame while the actor is active. It updates vision,
+	// movement, facing direction, and floating/bobbing behavior.
+	virtual void Tick(float DeltaTime) override;
+
+	// Override TakeDamage so attacks and projectiles deal no damage.
+	// Returning zero tells Unreal that the enemy received no damage.
+	virtual float TakeDamage(float Damage, struct FDamageEvent const& DamageEvent, AController* EventInstigator, AActor* DamageCauser) override;
+
+protected:
+	// BeginPlay runs once when the game starts or when the actor is spawned.
+	// This is when the enemy records its starting area and chooses its first path.
+	virtual void BeginPlay() override;
+
+	// The invisible collision root for the pawn. It is also collision-disabled,
+	// so the eye is not a physical obstacle or a hittable target.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Eye Enemy|Components", meta = (AllowPrivateAccess = "true"))
+	USphereComponent* CollisionComponent;
+
+	// Assign the visible eye mesh and its material in the Unreal Details panel.
+	// This C++ component is where the assigned asset appears. No Blueprint is required.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Eye Enemy|Components", meta = (AllowPrivateAccess = "true"))
+	UStaticMeshComponent* EyeMesh;
+
+	// The spotlight attached to the eye. It can be disabled with bLightEnabled
+	// or by changing the intensity and attenuation values in the Unreal Editor.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Eye Enemy|Components", meta = (AllowPrivateAccess = "true"))
+	USpotLightComponent* EyeLight;
+
+	// FloatingPawnMovement moves this Pawn without requiring a Character or
+	// ground-based CharacterMovementComponent. It supports free 3D movement.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Eye Enemy|Components", meta = (AllowPrivateAccess = "true"))
+	UFloatingPawnMovement* FloatingMovement;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.0))
+	float WanderSpeed = 150.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.0))
+	float PursuitSpeed = 300.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.0))
+	float WanderRadius = 800.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.1))
+	float WanderPointInterval = 4.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 1.0))
+	float NavigationPointAcceptanceRadius = 75.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.0))
+	float BobbingAmplitude = 25.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Movement", meta = (ClampMin = 0.1))
+	float BobbingFrequency = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Vision", meta = (ClampMin = 1.0))
+	float VisionRange = 1500.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Vision", meta = (ClampMin = 0.0, ClampMax = 180.0))
+	float VisionAngleDegrees = 100.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Vision", meta = (ClampMin = 0.05))
+	float VisionCheckInterval = 0.1f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Light")
+	bool bLightEnabled = true;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Light")
+	float LightIntensity = 5000.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Eye Enemy|Light")
+	float LightAttenuationRadius = 1200.0f;
+
+private:
+	// Runtime state: these values are maintained by C++ during play.
+	// WanderOrigin is the area center. CurrentPath is the NavMesh route.
+	FVector WanderOrigin = FVector::ZeroVector;
+	TArray<FVector> CurrentPath;
+	int32 CurrentPathIndex = 0;
+	float NextWanderTime = 0.0f;
+	float NextVisionCheckTime = 0.0f;
+	float NextPursuitPathTime = 0.0f;
+	float BobbingTime = 0.0f;
+	float PreviousBobbingOffset = 0.0f;
+
+	// The pawn controlled by player zero. This is filled in BeginPlay using
+	// UGameplayStatics, similar to the ATower::Tank setup in the example.
+	APawn* PlayerPawn = nullptr;
+
+	// CurrentPlayerTarget becomes non-null only while a valid player is in sight.
+	AActor* CurrentPlayerTarget = nullptr;
+
+	// Private helper functions implement the behavior. They do not need to be
+	// exposed or called by Blueprint; Tick automatically calls them each frame.
+	void ChooseWanderPoint();
+	void ChooseNavPoint(const FVector& Destination);
+	void MoveAlongCurrentPath(float DeltaTime);
+	void UpdateVision();
+	void UpdateBobbing(float DeltaTime);
+	void UpdateRotation(float DeltaTime);
+};
